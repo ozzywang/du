@@ -45,7 +45,7 @@ def have_nvenc():
         with open(err_path, "w", encoding="utf-8") as ef:
             r = subprocess.run(
                 [FFMPEG, "-y", "-v", "error", "-f", "lavfi", "-i",
-                 "color=size=64x64:duration=0.1:rate=30",
+                 "color=size=1920x1080:duration=0.1:rate=30",
                  "-c:v", "hevc_nvenc", "-f", "null", "-"],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=ef,
                 timeout=60, creationflags=CREATE_NO_WINDOW)
@@ -80,7 +80,7 @@ def frame_diffs(path, thumb_w=256):
     src_w, src_h = map(int, r.stdout.strip().splitlines()[0].split(","))
     thumb_h = max(2, int(round(src_h * thumb_w / src_w / 2) * 2))
     frame_size = thumb_w * thumb_h
-    cmd = [FFMPEG, "-v", "error", "-i", path, "-vf", f"scale={thumb_w}:-2",
+    cmd = [FFMPEG, "-v", "error", "-noautorotate", "-i", path, "-vf", f"scale={thumb_w}:-2",
            "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"]
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, bufsize=10**7,
@@ -130,6 +130,20 @@ def build_select(segments):
     return "+".join(
         f"between(n,{s},{e-1})*not(eq(mod(n,5),{ph}))" for s, e, ph in segments)
 
+def fps_to_tb(s):
+    """把用户输入的帧率转成ffmpeg时间基。'23.976'->'24000/1001', 其余原样"""
+    try:
+        f = float(s)
+    except (TypeError, ValueError):
+        return None
+    if abs(f - 24000 / 1001) < 0.01:
+        return "24000/1001"
+    if abs(f - 30000 / 1001) < 0.01:
+        return "30000/1001"
+    if f == int(f):
+        return str(int(f))
+    return repr(f)
+
 def process_file(input_path, output_path, src_fps, cq, use_nvenc, progress_cb, log_cb):
     """处理单个文件。返回 (成功, 信息)"""
     fps, nb_frames, duration = probe(input_path)
@@ -147,40 +161,49 @@ def process_file(input_path, output_path, src_fps, cq, use_nvenc, progress_cb, l
     for s, e, ph in segments:
         log_cb(f"       帧[{s:>6},{e:>6}) 相位={ph}")
 
-    out_fps = "24000/1001" if src_fps == "23.976" else "24"
-    vf = f"select='{build_select(segments)}',setpts=N/{out_fps}/TB"
+    out_fps = fps_to_tb(src_fps)
+    if out_fps is None:
+        return False, f"素材帧率 '{src_fps}' 无法识别，请输入数字（如 24 或 23.976）"
+    vf = f"select='{build_select(segments)}',setpts=N/({out_fps})/TB"
+    attempts = []
     if use_nvenc:
-        vcodec = ["-c:v", "hevc_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", str(cq)]
-    else:
-        vcodec = ["-c:v", "libx265", "-crf", str(cq), "-preset", "medium", "-tag:v", "hvc1"]
-    cmd = [FFMPEG, "-y", "-v", "info", "-nostats", "-i", input_path,
-           "-vf", vf, "-r", out_fps] + vcodec + ["-c:a", "copy",
-           "-progress", "pipe:1", output_path]
+        attempts.append(("HEVC NVENC",
+                         ["-c:v", "hevc_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", str(cq)]))
+    attempts.append(("CPU libx265",
+                     ["-c:v", "libx265", "-crf", str(cq), "-preset", "medium", "-tag:v", "hvc1"]))
 
-    log_cb("[转码] " + ("HEVC NVENC" if use_nvenc else "CPU libx265"))
-    # stderr写入临时文件而非管道: 防止ffmpeg写满stderr管道缓冲区导致死锁
     import tempfile
     err_path = None
+    last_err = ""
     try:
         with tempfile.NamedTemporaryFile(suffix=".log", delete=False) as tf:
             err_path = tf.name
-        with open(err_path, "w", encoding="utf-8", errors="ignore") as ef:
-            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
-                                 stderr=ef, text=True, creationflags=CREATE_NO_WINDOW)
-            total_ms = duration * 1000
-            for line in p.stdout:
-                if line.startswith("out_time_ms="):
-                    try:
-                        t = int(line.strip().split("=")[1])
-                        progress_cb(10 + min(89, int(89 * t / max(total_ms, 1))))
-                    except ValueError:
-                        pass
-            p.wait()
-        if p.returncode != 0:
+        for name, vcodec in attempts:
+            log_cb(f"[转码] {name}")
+            cmd = [FFMPEG, "-y", "-v", "info", "-nostats", "-i", input_path,
+                   "-vf", vf, "-r", out_fps] + vcodec + ["-c:a", "copy",
+                   "-progress", "pipe:1", output_path]
+            # stderr写入临时文件而非管道: 防止ffmpeg写满stderr管道缓冲区导致死锁
+            with open(err_path, "w", encoding="utf-8", errors="ignore") as ef:
+                p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                                     stderr=ef, text=True, creationflags=CREATE_NO_WINDOW)
+                total_ms = duration * 1000
+                for line in p.stdout:
+                    if line.startswith("out_time_ms="):
+                        try:
+                            t = int(line.strip().split("=")[1])
+                            progress_cb(10 + min(89, int(89 * t / max(total_ms, 1))))
+                        except ValueError:
+                            pass
+                p.wait()
+            if p.returncode == 0:
+                progress_cb(99)
+                break
             with open(err_path, encoding="utf-8", errors="ignore") as f:
-                err = f.read()
-            return False, "ffmpeg转码失败: " + (err.strip()[-400:] or f"返回码{p.returncode}")
-        progress_cb(99)
+                last_err = f.read().strip()
+            log_cb(f"[警告] {name}失败, 错误: {last_err[-200:]}", )
+        else:
+            return False, "ffmpeg转码失败: " + (last_err[-400:] or "未知错误")
     finally:
         if err_path and os.path.exists(err_path):
             try: os.unlink(err_path)
@@ -216,11 +239,10 @@ class App(tk.Tk):
 
         frm_opt = ttk.LabelFrame(self, text="选项"); frm_opt.pack(fill="x", padx=10, pady=6)
         row1 = ttk.Frame(frm_opt); row1.pack(fill="x", padx=8, pady=4)
-        ttk.Label(row1, text="素材真实帧率:").pack(side="left")
+        ttk.Label(row1, text="素材真实帧率(fps):").pack(side="left")
         self.src_fps = tk.StringVar(value="24")
-        ttk.Radiobutton(row1, text="24", variable=self.src_fps, value="24").pack(side="left", padx=4)
-        ttk.Radiobutton(row1, text="23.976", variable=self.src_fps, value="23.976").pack(side="left")
-        ttk.Label(row1, text="   画质 CQ/CRF:").pack(side="left")
+        ttk.Entry(row1, textvariable=self.src_fps, width=8).pack(side="left", padx=4)
+        ttk.Label(row1, text="(如 24 / 23.976 / 25)   画质 CQ/CRF:").pack(side="left")
         self.cq = tk.IntVar(value=24)
         ttk.Scale(row1, from_=18, to=32, variable=self.cq, orient="horizontal",
                   length=120).pack(side="left")
@@ -278,6 +300,9 @@ class App(tk.Tk):
         files = list(self.listbox.get(0, "end"))
         if not files:
             messagebox.showwarning("提示", "请先添加文件")
+            return
+        if fps_to_tb(self.src_fps.get()) is None:
+            messagebox.showerror("错误", f"素材真实帧率 '{self.src_fps.get()}' 不是有效数字\n请输入如 24 或 23.976")
             return
         if not self.nvenc_ok and not self.fallback.get():
             messagebox.showerror("错误", "未检测到NVIDIA NVENC，且未允许CPU回退")
