@@ -30,24 +30,43 @@ def _find_bin(name):
 FFMPEG = _find_bin("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
 FFPROBE = _find_bin("ffprobe.exe" if os.name == "nt" else "ffprobe")
 
+# Windows下以无窗口方式启动子进程（避免打包成GUI程序后弹控制台黑窗/句柄无效）
+CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
 # ---------------- 核心处理逻辑 ----------------
 
 def have_nvenc():
-    """检测NVENC是否真正可用（列出编码器≠显卡存在，需试编码一帧）"""
+    """检测NVENC是否真正可用。返回(是否可用, 失败详情)"""
+    import tempfile
+    err_path = None
     try:
-        r = subprocess.run(
-            [FFMPEG, "-v", "error", "-f", "lavfi", "-i", "color=size=64x64:duration=0.1",
-             "-c:v", "hevc_nvenc", "-f", "null", "-"],
-            capture_output=True, timeout=30)
-        return r.returncode == 0
-    except Exception:
-        return False
+        with tempfile.NamedTemporaryFile(suffix=".log", delete=False) as tf:
+            err_path = tf.name
+        with open(err_path, "w", encoding="utf-8") as ef:
+            r = subprocess.run(
+                [FFMPEG, "-y", "-v", "error", "-f", "lavfi", "-i",
+                 "color=size=64x64:duration=0.1:rate=30",
+                 "-c:v", "hevc_nvenc", "-f", "null", "-"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=ef,
+                timeout=60, creationflags=CREATE_NO_WINDOW)
+        detail = ""
+        if r.returncode != 0:
+            with open(err_path, encoding="utf-8", errors="ignore") as f:
+                detail = f.read().strip()[:300]
+        return r.returncode == 0, detail
+    except Exception as e:
+        return False, str(e)[:300]
+    finally:
+        if err_path and os.path.exists(err_path):
+            try: os.unlink(err_path)
+            except OSError: pass
 
 def probe(path):
     r = subprocess.run(
         [FFPROBE, "-v", "error", "-select_streams", "v:0",
          "-show_entries", "stream=avg_frame_rate,nb_frames,duration",
-         "-of", "json", path], capture_output=True, text=True, check=True)
+         "-of", "json", path], capture_output=True, text=True, check=True,
+        creationflags=CREATE_NO_WINDOW)
     import json
     s = json.loads(r.stdout)["streams"][0]
     num, den = s["avg_frame_rate"].split("/")
@@ -56,13 +75,16 @@ def probe(path):
 def frame_diffs(path, thumb_w=256):
     r = subprocess.run([FFPROBE, "-v", "error", "-select_streams", "v:0",
                         "-show_entries", "stream=width,height",
-                        "-of", "csv=p=0", path], capture_output=True, text=True, check=True)
+                        "-of", "csv=p=0", path], capture_output=True, text=True, check=True,
+                       creationflags=CREATE_NO_WINDOW)
     src_w, src_h = map(int, r.stdout.strip().splitlines()[0].split(","))
     thumb_h = max(2, int(round(src_h * thumb_w / src_w / 2) * 2))
     frame_size = thumb_w * thumb_h
     cmd = [FFMPEG, "-v", "error", "-i", path, "-vf", f"scale={thumb_w}:-2",
            "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"]
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=10**7)
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, bufsize=10**7,
+                         creationflags=CREATE_NO_WINDOW)
     diffs, prev = [], None
     while True:
         buf = p.stdout.read(frame_size)
@@ -136,19 +158,33 @@ def process_file(input_path, output_path, src_fps, cq, use_nvenc, progress_cb, l
            "-progress", "pipe:1", output_path]
 
     log_cb("[转码] " + ("HEVC NVENC" if use_nvenc else "CPU libx265"))
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    total_ms = duration * 1000
-    for line in p.stdout:
-        if line.startswith("out_time_ms="):
-            try:
-                t = int(line.strip().split("=")[1])
-                progress_cb(10 + min(89, int(89 * t / max(total_ms, 1))))
-            except ValueError:
-                pass
-    _, err = p.communicate()
-    if p.returncode != 0:
-        return False, "ffmpeg转码失败: " + err[-400:]
-    progress_cb(99)
+    # stderr写入临时文件而非管道: 防止ffmpeg写满stderr管道缓冲区导致死锁
+    import tempfile
+    err_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".log", delete=False) as tf:
+            err_path = tf.name
+        with open(err_path, "w", encoding="utf-8", errors="ignore") as ef:
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                                 stderr=ef, text=True, creationflags=CREATE_NO_WINDOW)
+            total_ms = duration * 1000
+            for line in p.stdout:
+                if line.startswith("out_time_ms="):
+                    try:
+                        t = int(line.strip().split("=")[1])
+                        progress_cb(10 + min(89, int(89 * t / max(total_ms, 1))))
+                    except ValueError:
+                        pass
+            p.wait()
+        if p.returncode != 0:
+            with open(err_path, encoding="utf-8", errors="ignore") as f:
+                err = f.read()
+            return False, "ffmpeg转码失败: " + (err.strip()[-400:] or f"返回码{p.returncode}")
+        progress_cb(99)
+    finally:
+        if err_path and os.path.exists(err_path):
+            try: os.unlink(err_path)
+            except OSError: pass
 
     fps_o, nb_o, dur_o = probe(output_path)
     log_cb(f"[完成] 输出 {fps_o:.3f}fps, {nb_o}帧, 时长差{abs(dur_o-duration):.3f}s")
@@ -212,8 +248,10 @@ class App(tk.Tk):
         self.log.tag_config("ok", foreground="#6fcf6f")
         self.log.tag_config("err", foreground="#e06c6c")
 
-        self.nvenc_ok = have_nvenc()
+        self.nvenc_ok, nvenc_detail = have_nvenc()
         self.log_msg(f"NVENC检测: {'可用 ✅' if self.nvenc_ok else '不可用 ❌ (将回退CPU)'}\n")
+        if not self.nvenc_ok and nvenc_detail:
+            self.log_msg(f"[NVENC失败详情] {nvenc_detail}\n", "err")
         self.after(100, self.poll)
 
     def add_files(self):
