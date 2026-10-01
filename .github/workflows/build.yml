@@ -1,0 +1,38 @@
+name: build-exe
+on:
+  workflow_dispatch:   # 手动触发
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: pip install pyinstaller numpy
+
+      - name: 下载并解压 ffmpeg
+        run: |
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip .
+          $d = Get-ChildItem -Directory "ffmpeg-*-essentials_build" | Select-Object -First 1
+          Copy "$d\bin\ffmpeg.exe" .
+          Copy "$d\bin\ffprobe.exe" .
+
+      - name: 打包 exe（内嵌 ffmpeg，单文件）
+        run: |
+          pyinstaller --noconfirm --clean --windowed --onefile `
+            --name fps24_restore `
+            --add-binary "ffmpeg.exe;." `
+            --add-binary "ffprobe.exe;." `
+            fps24_gui.py
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: fps24_restore_exe
+          path: dist/fps24_restore.exe
